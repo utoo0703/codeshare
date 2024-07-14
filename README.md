@@ -1,7 +1,8 @@
 # codeshare
 Sharing code accross network
 agents.py-
-![architecture_diagram_refined](https://github.com/user-attachments/assets/969597d9-93a5-45fe-997e-6ccca5dafb9e)
+![architecture_diagram_refined](https://github.com/user-attachments/assets/bce45f62-d5c3-4b70-98b0-a57938de308a)
+
 
 
 chat_app.py-
