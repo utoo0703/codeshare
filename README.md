@@ -4,293 +4,245 @@ Sharing code accross network
 
 agents.py-
 ![architecture_diagram_refined](https://github.com/user-attachments/assets/bce45f62-d5c3-4b70-98b0-a57938de308a)
-import os
-import sys
-import sqlite3
-import logging
-from io import StringIO
-from typing import Any, List
-from dotenv import load_dotenv
-from dbs.langchain.llms import StorkLLM
-from ada_genai.vertexai import GenerativeModel
-from ada_genai.auth import sso_auth
-import pandas as pd
-import json
-import numpy as np
-from json import JSONEncoder
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-load_dotenv()
-
-stork_llm = StorkLLM(
-    provider=os.getenv('STORK_PROVIDER'),
-    provider_id=os.getenv('STORK_PROVIDER_ID'),
-    model_id=os.getenv('STORK_MODEL_ID'),
-    id_token=os.getenv('ID_TOKEN')
-)
-
-sso_auth.login()
-gemini_model = GenerativeModel(os.getenv('GEMINI_MODEL_NAME'))
-
-class NumpyEncoder(JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return JSONEncoder.default(self, obj)
-
-class PythonREPLTool:
-    def execute(self, code: str) -> str:
-        logger.info(f"Executing Python code: {code}")
-        old_stdout = sys.stdout
-        redirected_output = sys.stdout = StringIO()
-        result = None
-        try:
-            exec_globals = {}
-            exec(code, exec_globals)
-            result = exec_globals.get('result', None)
-        except Exception as e:
-            logger.error(f"Error executing Python code: {str(e)}")
-            return f"Error: {str(e)}"
-        finally:
-            sys.stdout = old_stdout
-            output = redirected_output.getvalue()
-            if result is not None:
-                return f"Output: {output}\nResult: {result}"
-            elif output:
-                return f"Output: {output}"
-            else:
-                return "Code executed successfully, but produced no output or result."
-
-class SQLiteTool:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self.schema = self.get_db_schema()
-
-    def get_db_schema(self):
-        schema = {}
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                tables = cursor.fetchall()
-                for table in tables:
-                    table_name = table[0]
-                    cursor.execute(f"PRAGMA table_info({table_name})")
-                    columns = cursor.fetchall()
-                    schema[table_name] = {
-                        "columns": [column[1] for column in columns],
-                        "foreign_keys": []
-                    }
-                    cursor.execute(f"PRAGMA foreign_key_list({table_name})")
-                    foreign_keys = cursor.fetchall()
-                    for fk in foreign_keys:
-                        schema[table_name]["foreign_keys"].append({
-                            "column": fk[3],
-                            "referenced_table": fk[2],
-                            "referenced_column": fk[4]
-                        })
-        except Exception as e:
-            logger.error(f"Error getting database schema: {str(e)}")
-            schema = {"error": [f"Failed to retrieve schema: {str(e)}"]}
-        return schema
-
-    def get_schema_string(self):
-        if not self.schema or "error" in self.schema:
-            return f"Error retrieving schema: {self.schema.get('error', ['Unknown error'])}"
-        schema_str = "Database Schema:\n"
-        for table, info in self.schema.items():
-            schema_str += f"Table: {table}\nColumns: {', '.join(info['columns'])}\n"
-            if info['foreign_keys']:
-                schema_str += "Foreign Keys:\n"
-                for fk in info['foreign_keys']:
-                    schema_str += f" - {fk['column']} references {fk['referenced_table']}({fk['referenced_column']})\n"
-            schema_str += "\n"
-        return schema_str
-
-    def execute(self, query: str) -> Any:
-        logger.info(f"Executing SQL query: {query}")
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                df = pd.read_sql_query(query, conn)
-                logger.info(f"SQL query result: {df.to_string()}")
-                return df
-        except sqlite3.OperationalError as e:
-            logger.error(f"SQLite Error: {str(e)}")
-            return f"SQLite Error: {str(e)}\nQuery: {query}"
-        except Exception as e:
-            logger.error(f"Error executing SQL query: {str(e)}")
-            return f"Error: {str(e)}\nQuery: {query}"
-
-    def get_statistics(self, df, column):
-        if df[column].dtype in ['int64', 'float64']:
-            stats = {
-                'count': df[column].count(),
-                'mean': df[column].mean(),
-                'std': df[column].std(),
-                'min': df[column].min(),
-                '25th': df[column].quantile(0.25),
-                'median': df[column].median(),
-                '75th': df[column].quantile(0.75),
-                'max': df[column].max()
-            }
-            return stats
-        else:
-            return {'error': 'Column is not numeric'}
-
-class Agent:
-    def __init__(self, tool):
-        self.tool = tool
-
-    def interact(self, query: str) -> str:
-        logger.info(f"Agent interacting with query: {query}")
-        return self.tool.execute(query)
-
-class NLPExplanationAgent(Agent):
-    def __init__(self, model):
-        super().__init__(model)
-
-    def interact(self, query: str) -> str:
-        logger.info(f"NLP Agent explaining: {query}")
-        response = self.tool.generate_content(query).text
-        return response
-
-class RouterAgent:
-    def __init__(self, python_agent: Agent, sql_agent: Agent, nlp_agent: NLPExplanationAgent):
-        self.python_agent = python_agent
-        self.sql_agent = sql_agent
-        self.nlp_agent = nlp_agent
-        self.gemini_model = gemini_model
-
-        try:
-            self.db_schema = self.sql_agent.tool.get_schema_string()
-            if self.db_schema.startswith("Error retrieving schema"):
-                logger.error(f"Failed to retrieve database schema: {self.db_schema}")
-            else:
-                logger.info(f"Initialized RouterAgent with schema: {self.db_schema}")
-        except Exception as e:
-            logger.error(f"Error initializing RouterAgent: {str(e)}")
-            self.db_schema = "Error: Unable to retrieve database schema"
-
-    def interact(self, query: str) -> str:
-        logger.info(f"Router Agent processing query: {query}")
-        query_type = self.classify_query(query)
-        logger.info(f"Query classified as: {query_type}")
-
-        try:
-            if query_type == "python":
-                result = self.python_agent.interact(query)
-                nlp_result = self.nlp_agent.interact(f"Infer from this Python result in natural language: {result}")
-                explanation = self.nlp_agent.interact(f"Explain this Python result in detail: {result}")
-                return f"PYTHON:{result}\n\nInference: {nlp_result}\n\nExplanation: {explanation}"
-
-            elif query_type == "sql":
-                sql_query = self.natural_language_to_sql(query)
-                if sql_query.startswith("Unable to create query"):
-                    return f"I'm sorry, but I can't create a SQL query to answer this question based on the available database schema. {sql_query}"
-                sql_query = self.clean_sql_query(sql_query)
-                logger.info(f"Cleaned SQL query: {sql_query}")
-                result = self.sql_agent.interact(sql_query)
-                if isinstance(result, str) and (result.startswith("SQLite Error:") or result.startswith("Error:")):
-                    logger.error(f"SQL query execution error: {result}")
-                    return f"SQL:{sql_query}\n\nError: {result}"
-                if isinstance(result, pd.DataFrame):
-                    stats = {col: self.sql_agent.tool.get_statistics(result, col) for col in result.columns if result[col].dtype in ['int64', 'float64']}
-                    inference = self.nlp_agent.interact(f"""Infer from this SQL query result in natural language:
- 
- 1. Explain what the query is doing.
- 
- 2. Provide context for the result (e.g., if it's a currency amount, mention the currency if known).
- 
- 3. If applicable, compare the result to typical values or explain its significance.
- 
- 4. Mention the number of rows and columns in the result.
- 
- 5. Briefly describe what each column represents.
- 
- 6. Highlight any notable patterns or important data points.
-
-
-
- Query: {sql_query}
-
- Result: {result.to_string()}""")
-                    return f"SQL:{sql_query}\n\nDATA:{result.to_json(orient='records')}\n\nSTATS:{json.dumps(stats, cls=NumpyEncoder)}\n\nInference: {inference}"
-                else:
-                    return f"SQL:{sql_query}\n\nError: Unexpected result type"
-
-            else: 
-                nlp_result = self.nlp_agent.interact(query)
-                return f"NLP:{nlp_result}"
-
-        except Exception as e:
-            logger.error(f"Error in RouterAgent: {str(e)}")
-            return f"An error occurred: {str(e)}"
-
-    def classify_query(self, query: str) -> str:
-        logger.info(f"Classifying query: {query}")
-        prompt = f"Classify the following query as 'python', 'sql', or 'nlp':\n{query}\nClassification:"
-        classification = self.gemini_model.generate_content(prompt).text.strip().lower()
-        logger.info(f"Query classified as: {classification}")
-        return classification
-
-    def natural_language_to_sql(self, query: str) -> str:
-        logger.info(f"Converting natural language to SQL: {query}")
-        try:
-            prompt = f"""Convert the following natural language query into a valid SQL query.
-            Use only the tables and columns present in the given database schema.
-            Joins between tables are supported and encouraged when necessary.
-            If query consists of a name then consider it as a customer name.
-            If name not found in Database respond "Unable to find customer with 'given name'.
-            If the query requires joining multiple tables, use appropriate JOIN clauses.
-            If the query cannot be answered with the available schema, respond with "Unable to create query with given schema." 
-            Complete the response.
-            Database Schema:
-            {self.db_schema}
-
-            Example of a query with a join:
-            Natural language: Show me the names of customers and their order dates
-            SQL: SELECT customers.name, orders.order_date FROM customers JOIN orders ON customers.customer_id = orders.customer_id
-
-            Natural language query: {query}
-
-            SQL query:"""
-            response = self.gemini_model.generate_content(prompt).text.strip()
-            return response
-        except Exception as e:
-            logger.error(f"Error converting natural language to SQL: {str(e)}")
-            return f"Unable to create query: {str(e)}"
-
-    def clean_sql_query(self, query: str) -> str:
-        logger.info(f"Cleaning SQL query: {query}")
-        cleaned_query = query.replace("```sql", "").replace("```", "").strip()
-        return cleaned_query
-
-    def change_database(self, new_db_path: str):
-        self.sql_agent.tool.db_path = new_db_path
-        self.sql_agent.tool.schema = self.sql_agent.tool.get_db_schema()
-        self.db_schema = self.sql_agent.tool.get_schema_string()
-        logger.info(f"Changed database to: {new_db_path}")
-
-python_tool = PythonREPLTool()
-sql_tool = SQLiteTool(os.getenv('SQLITE_DB_PATH', 'database.db'))
-
-python_agent = Agent(python_tool)
-sql_agent = Agent(sql_tool)
-nlp_agent = NLPExplanationAgent(gemini_model)
-
-router_agent = RouterAgent(python_agent, sql_agent, nlp_agent)
-
-__all__ = ['router_agent', 'RouterAgent']
-
-logger.info("Agents module initialized successfully")
 
 
 chat_app.py-
 ![image](https://github.com/user-attachments/assets/0710e722-ad50-4781-989f-c2c3291442e0)
+v6.0
+•	1. Introduction
+•	2. MVP 1.0 Features 
+o	2.1 Enhanced Query Processing:
+o	2.2 Multi-Agent System:
+o	2.3 Data Visualization:
+o	2.4 Statistical Analysis:
+o	2.5 User Interface Improvements:
+•	3. User Interface (UI) 
+o	3.1 Main Chat Interface:
+o	3.2 Visualization Area:
+o	3.3 Sidebar:
+•	4. Input/Output Mechanisms 
+o	4.1 Input Mechanisms:
+o	4.2 Output Mechanisms:
+•	5. Workflow and User Scenarios 
+o	5.1 Basic Query Workflow:
+o	5.2 Data Exploration Scenario:
+o	5.3 Custom Visualization Scenario:
+•	6. Architecture 
+o	6.1 Architecture Diagram:
+o	6.2 High-Level Architecture Explanation 
+	6.2.1 Overview
+	6.2.2 Components and Workflow
+•	7. Technical Details 
+o	7.1 Technology Stack:
+o	7.2 Key Components:
+•	8. LLM Usage in Enterprise Data Assistant 
+o	8.1 Gemini Model 
+	8.1.1 Query Classification
+	8.1.2 Natural Language to SQL Conversion
+o	8.2 Vertex AI Text-Bison Model 
+	8.2.1 SQL Query Generation
+o	8.3 Key Differences and Workflow 
+	8.3.1 Task Specificity
+	8.3.2 Level of Detail
+	8.3.3 Specialization
+	8.3.4 Process Flow
+o	8.4 Rationale
+•	9. Limitations and Known Issues
+•	10. Future Development Plans
+•	11. Product Demonstration-
+•  
+
+1. Introduction
+Project Overview: The Enterprise Data Assistant MVP 1.0 is an AI-powered tool designed to simplify data interaction and analysis for businesses. It bridges the gap between complex databases and non-technical users, enabling effortless data exploration, analysis, and visualization.
+Purpose of the Document: This document outlines the features, capabilities, and technical details of the Enterprise Data Assistant MVP 1.0, serving as a comprehensive guide for users, developers, and stakeholders.
+2. MVP 1.0 Features
+2.1 Enhanced Query Processing:
+•	Increased input capacity, now supporting queries beyond the initial 500-character limit.
+•	Improved natural language understanding for more complex queries.
+2.2 Multi-Agent System:
+•	Router Agent: Classifies and directs queries to appropriate processing agents.
+•	SQL Agent: Executes SQL queries against the database.
+•	Python Agent: Performs complex calculations and data manipulations.
+•	NLP Agent: Handles natural language processing and generation.
+2.3 Data Visualization:
+•	Automatic chart selection based on query results.
+•	Support for various chart types including bar, line, scatter, histogram, box, and violin plots.
+•	Interactive visualizations powered by Plotly.
+2.4 Statistical Analysis:
+•	Automatic generation of statistical summaries for numeric data.
+•	Calculation of key statistics: count, mean, median, standard deviation, min, max, and percentiles.
+2.5 User Interface Improvements:
+•	Web-based interface built with Streamlit for enhanced user experience.
+•	Chat-like interaction for query input and result display.
+•	Sidebar for additional controls and information display.
+3. User Interface (UI)
+3.1 Main Chat Interface:
+•	Input field for user queries.
+•	Chat history display showing user inputs and system responses.
+•	Markdown support for formatted text output.
+3.2 Visualization Area:
+•	Dynamic display of charts and graphs based on query results.
+•	Options for customizing visualizations.
+3.3 Sidebar:
+•	Database selection dropdown.
+•	Option to view database schema.
+•	Chat history export functionality.
+•	Command log display.
+ 
+4. Input/Output Mechanisms
+4.1 Input Mechanisms:
+•	Text-based natural language queries.
+•	Support for direct SQL queries.
+•	Python code input for complex operations.
+4.2 Output Mechanisms:
+•	Formatted text responses for query results and explanations.
+•	Interactive data visualizations.
+•	Statistical summary tables.
+•	Error messages and suggestions for query improvement.
+5. Workflow and User Scenarios
+5.1 Basic Query Workflow:
+1.	User enters a natural language query.
+2.	Router Agent classifies the query type.
+3.	Query is processed by the appropriate agent (SQL, Python, or NLP).
+4.	Results are displayed in the chat interface.
+5.	Relevant visualizations and statistical summaries are generated automatically.
+5.2 Data Exploration Scenario:
+1.	User requests to see all data from a specific table.
+2.	System executes an SQL query to retrieve the data.
+3.	Results are displayed in a tabular format.
+4.	System automatically generates relevant visualizations (e.g., histograms for numeric columns).
+5.	Statistical summaries are provided for numeric columns.
+5.3 Custom Visualization Scenario:
+1.	User views initial query results and visualizations.
+2.	User selects custom visualization options from the interface.
+3.	System generates and displays the custom visualization.
+6. Architecture
+6.1 Architecture Diagram:
+
+ 
+6.2 High-Level Architecture Explanation
+6.2.1 Overview
+The architecture of the Enterprise Data Assistant MVP 1.0 is designed to process user queries, interact with AI models, and execute tasks such as SQL queries, Python code execution, and natural language processing (NLP).
+6.2.2 Components and Workflow
+•	User Interaction
+o	User: The end-user interacts with the system by entering a text query through the Streamlit interface.
+•	Streamlit UI
+o	Serves as the front-end for user input and result display.
+o	Handles chat history, visualization rendering, and user controls.
+•	Router Agent
+o	Central component that classifies the query type and routes it to the appropriate agent (Python, SQL, or NLP).
+•	Agents
+o	Python Agent: Handles queries requiring Python code execution for data analysis and manipulation.
+o	SQL Agent: Manages SQL queries, interacting with the SQLite database to fetch or manipulate data.
+o	NLP Agent: Processes natural language queries and generates human-readable responses.
+•	AI Model Integration
+o	Gemini Model: Utilized for advanced natural language understanding and generation tasks.
+o	Vertex AI's Text Bison: Utilized for SQL queries generation from inputted NLP.
+•	Processing and Execution
+o	Queries are processed by the respective agents.
+o	SQL queries are executed against the SQLite database.
+o	Python code is executed in a controlled environment.
+o	NLP tasks are processed using the Gemini model.
+•	Response Handling
+o	Results from query execution are processed by the respective agent.
+o	The Router Agent formats the response, including generating visualizations and statistical summaries when appropriate.
+•	Streamlit UI Display
+o	Processed output is displayed on the Streamlit UI, including: 
+	Text responses
+	Data visualizations
+	Statistical summaries
+	Error messages and suggestions
+•	User Feedback Loop
+o	Users can view results and submit follow-up queries, creating an interactive experience.
+7. Technical Details
+7.1 Technology Stack:
+•	Frontend: Streamlit
+•	Backend: Python
+•	Database: SQLite (with potential for expansion to other database systems)
+•	NLP: Custom implementation using advanced language models
+•	Visualization: Plotly, Seaborn
+•	Statistical Analysis: Pandas, NumPy
+7.2 Key Components:
+•	Router Agent: Implements query classification and routing logic.
+•	SQL Agent: Handles database interactions and SQL query execution.
+•	Python Agent: Executes Python code for complex data operations.
+•	NLP Agent: Processes natural language inputs and generates human-readable outputs.
+•	Visualization Engine: Selects and generates appropriate charts based on data characteristics.
+•	Statistical Analysis Module: Computes and formats statistical summaries.
+8. LLM Usage in Enterprise Data Assistant
+8.1 Gemini Model
+The Gemini model serves as our primary natural language understanding component, handling two crucial tasks:
+8.1.1 Query Classification
+Purpose: Determine the type of query (Python, SQL, or NLP).
+Process:
+•	Interprets user's intent from natural language input.
+•	Categorizes queries into predefined types.
+Example: Input: "Show me all employees in the IT department" Output: Classified as an SQL query
+8.1.2 Natural Language to SQL Conversion
+Purpose: Convert natural language queries into structured SQL-like formats.
+Process:
+•	Understands query intent.
+•	Maps natural language concepts to database structures.
+•	Produces a logical structure of the query.
+Example: Input: "Show me all employees in the IT department" Output: Structured form: "SELECT * FROM employees WHERE department = 'IT'"
+8.2 Vertex AI Text-Bison Model
+The Text-Bison model specializes in generating syntactically correct SQL queries.
+8.2.1 SQL Query Generation
+Purpose: Generate final, executable SQL queries.
+Process:
+•	Takes structured output from Gemini.
+•	Refines it into a valid SQL statement.
+•	Handles SQL syntax nuances, joins, and schema-specific requirements.
+Example: Input: Structured form from Gemini Output: "SELECT employee_id, name, position FROM employees WHERE department = 'IT';"
+8.3 Key Differences and Workflow
+8.3.1 Task Specificity
+•	Gemini: Broad NLP tasks (classification, high-level understanding)
+•	Text-Bison: Specialized SQL generation
+8.3.2 Level of Detail
+•	Gemini: High-level intent and structure
+•	Text-Bison: Low-level SQL syntax and schema details
+8.3.3 Specialization
+•	Gemini: General-purpose NLP model
+•	Text-Bison: SQL-specific model
+8.3.4 Process Flow
+•	Gemini classifies the query type.
+•	For SQL queries, Gemini converts to a structured form.
+•	Text-Bison generates the final SQL query from the structured form.
+8.4 Rationale
+This dual-model approach leverages each model's strengths:
+•	Gemini excels in broad language understanding.
+•	Text-Bison specializes in technical SQL generation.
+9. Limitations and Known Issues
+•	Limited to SQLite databases in the current version.
+•	Visualization options are pre-defined and may not cover all possible data representation needs.
+•	Complex queries involving multiple tables or advanced SQL features may have limited support.
+10. Future Development Plans
+•	Integration with additional database types (e.g., PostgreSQL, MySQL).
+•	Advanced machine learning capabilities for predictive analytics.
+•	Enhanced customization options for visualizations.
+•	Collaborative features for team-based data analysis.
+•	API development for integration with other enterprise software.
+11. Product Demonstration-
+ 
+ 
+ 
+
+ 
+ 
+ 
+ 
+ 
+ 
+
+ 
+
+
+
+
+
+
+
+
+
+
 
